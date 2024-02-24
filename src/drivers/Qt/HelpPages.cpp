@@ -42,12 +42,38 @@
 #include "Qt/ConsoleUtilities.h"
 
 #if defined(WIN32)
+#if defined(UNICODE) || defined(_UNICODE)
+#include <stdexcept>
+#include <vector>
+#endif
+
 #include <Windows.h>
 #include <htmlhelp.h>
 //#else // Linux or Unix or APPLE
 //#include <unistd.h>
 //#include <sys/types.h>
 //#include <sys/wait.h>
+#endif
+
+#if defined(WIN32) && (defined(UNICODE) || defined(_UNICODE))
+wstring utf8toUtf16(const string& str)
+{
+    if (str.empty())
+        return wstring();
+
+    size_t charsNeeded = ::MultiByteToWideChar(CP_UTF8, 0,
+        str.data(), (int)str.size(), NULL, 0);
+    if (charsNeeded == 0)
+        throw runtime_error("Failed converting UTF-8 string to UTF-16");
+
+    vector<wchar_t> buffer(charsNeeded);
+    int charsConverted = ::MultiByteToWideChar(CP_UTF8, 0,
+        str.data(), (int)str.size(), &buffer[0], buffer.size());
+    if (charsConverted == 0)
+        throw runtime_error("Failed converting UTF-8 string to UTF-16");
+
+    return wstring(&buffer[0], charsConverted);
+}
 #endif
 
 //#if  defined(__linux__) || defined(__unix__) || defined(__APPLE__)
@@ -59,7 +85,7 @@ void consoleWin_t::OpenHelpWindow(std::string subpage)
     std::string helpFileName;
 #if defined(UNICODE) || defined(_UNICODE)
     std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-    std::wstring wHelpFileName = converter.from_bytes(helpFileName.c_str());
+    std::wstring wHelpFileName = utf8toUtf16(helpFileName);
 #endif
     
     g_config->getOption ("SDL.HelpFilePath", &helpFileName );
