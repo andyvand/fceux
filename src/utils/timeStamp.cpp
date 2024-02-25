@@ -16,12 +16,8 @@
 //-------------------------------------------------------------------------
 #ifdef __FCEU_X86_TSC_ENABLE
 #if defined(WIN32)
-#if defined(_M_IX86) || defined(_M_AMD64) || defined(__i386__) || defined(__x86_64__)
-#include <intrin.h>__
+#include <intrin.h>
 #pragma intrinsic(__rdtsc)
-#else
-#include <windows.h>
-#endif
 #else
 #if defined(__x86_64_) || defined(__i386__)
 #include <x86intrin.h>
@@ -45,17 +41,9 @@ static uint64_t rdtsc()
 
     return val;
 #else
-#if defined(_M_IX86) || defined(_M_AMD64) || defined(__i386__) || defined(__x86_64__)
 	return __rdtsc();
-#else
-	LARGE_INTEGER val;
-
-	QueryPerformanceCounter(&val);
-
-	return (uint64_t)(val.QuadPart);
 #endif
-#endif
-+}
+}
 #endif
 
 namespace FCEU
