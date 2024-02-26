@@ -26,6 +26,7 @@
 #include "../../movie.h"
 #include "../../debug.h"
 #include "utils/crc32.h"
+#include "utils/timeStamp.h"
 #include "utils/StringUtils.h"
 #include "Qt/main.h"
 #include "Qt/dface.h"
@@ -143,6 +144,9 @@ NetPlayServer::NetPlayServer(QObject *parent)
 	instance = this;
 
 	connect(this, SIGNAL(newConnection(void)), this, SLOT(newConnectionRdy(void)));
+
+	connect(consoleWindow, SIGNAL(romLoaded(void)), this, SLOT(onRomLoad(void)));
+	connect(consoleWindow, SIGNAL(nesResetOccurred(void)), this, SLOT(onNesReset(void)));
 }
 
 
@@ -328,6 +332,7 @@ int NetPlayServer::sendStateSyncReq( NetPlayClient *client )
 	sendMsg( client, em.buf(), em.size() );
 
 	opsCrc32 = 0;
+	inputClear();
 
 	return 0;
 }
@@ -363,6 +368,29 @@ bool NetPlayServer::claimRole(NetPlayClient* client, int _role)
 		}
 	}
 	return success;
+}
+//-----------------------------------------------------------------------------
+void NetPlayServer::onRomLoad()
+{
+	//printf("New ROM Loaded!\n");
+
+	// New ROM has been loaded by server, signal clients to load and sync
+	for (auto& client : clientList )
+	{
+		sendRomLoadReq( client );
+		sendStateSyncReq( client );
+	}
+}
+//-----------------------------------------------------------------------------
+void NetPlayServer::onNesReset()
+{
+	//printf("New ROM Loaded!\n");
+
+	// NES Reset has occurred on server, signal clients sync
+	for (auto& client : clientList )
+	{
+		sendStateSyncReq( client );
+	}
 }
 //-----------------------------------------------------------------------------
 static void serverMessageCallback( void *userData, void *msgBuf, size_t msgSize )
@@ -482,6 +510,22 @@ void NetPlayServer::serverProcessMessage( NetPlayClient *client, void *msgBuf, s
 			}
 		}
 		break;
+		case NETPLAY_PING_RESP:
+		{
+
+			netPlayPingResp *ping = static_cast<netPlayPingResp*>(msgBuf);
+			ping->toHostByteOrder();
+
+			FCEU::timeStampRecord ts;
+			ts.readNew();
+
+			uint64_t diff = ts.toMilliSeconds() - ping->hostTimeStamp;
+
+			client->recordPingResult( diff );
+
+			//printf("Ping Latency ms: %llu    Avg:%f\n", static_cast<unsigned long long>(diff), client->getAvgPingDelay());
+		}
+		break;
 		default:
 			printf("Unknown Msg: %08X\n", msgId);
 		break;
@@ -494,7 +538,7 @@ void NetPlayServer::update(void)
 	bool shouldRunFrame = false;
 	unsigned int clientMinFrame = 0xFFFFFFFF;
 	unsigned int clientMaxFrame = 0;
-	const uint32_t maxLead = 5u;
+	const uint32_t maxLead = maxLeadFrames;
 	const uint32_t currFrame = static_cast<uint32_t>(currFrameCounter);
 	const uint32_t leadFrame = currFrame + maxLead;
 	const uint32_t lastFrame = inputFrameBack();
@@ -570,7 +614,8 @@ void NetPlayServer::update(void)
 	shouldRunFrame = (clientMinFrame != 0xFFFFFFFF) && 
 		(clientMinFrame >= lagFrame ) &&
 		(clientMaxFrame  < leadFrame) &&
-		(currFrame > lastFrame) && (numClientsPaused == 0);
+		( (currFrame > lastFrame) || (lastFrame == 0) ) &&
+		(numClientsPaused == 0);
 
 	//printf("Client Frame: Min:%u  Max:%u\n", clientMinFrame, clientMaxFrame);
 
@@ -596,17 +641,44 @@ void NetPlayServer::update(void)
 
 		runFrameReq.toNetworkByteOrder();
 
-		for (auto it = clientList.begin(); it != clientList.end(); it++)
+		for (auto& client : clientList )
 		{
-			NetPlayClient *client = *it;
-
 			if (client->state > 0)
 			{
 				sendMsg( client, &runFrameReq, sizeof(runFrameReq) );
 			}
 		}
 	}
+
+	bool shouldRunPing = (cycleCounter % 120) == 0;
 	
+	if (shouldRunPing)
+	{
+		FCEU::timeStampRecord ts;
+		ts.readNew();
+
+		netPlayPingReq  ping;
+		ping.hostTimeStamp = ts.toMilliSeconds();
+		ping.toNetworkByteOrder();
+
+		for (auto& client : clientList )
+		{
+			if (client->state > 0)
+			{
+				sendMsg( client, &ping, sizeof(ping) );
+			}
+		}
+	}
+
+	bool shouldFlushOutput = true;
+	if (shouldFlushOutput)
+	{
+		for (auto& client : clientList )
+		{
+			client->flushData();
+		}
+	}
+	cycleCounter++;
 }
 //-----------------------------------------------------------------------------
 //--- NetPlayClient
@@ -784,6 +856,30 @@ void NetPlayClient::onSocketError(QAbstractSocket::SocketError error)
 	emit errorOccurred(errorMsg);
 }
 //-----------------------------------------------------------------------------
+void NetPlayClient::recordPingResult( uint64_t delay_ms )
+{
+	pingNumSamples++;
+	pingDelayLast = delay_ms;
+	pingDelaySum += delay_ms;
+}
+//-----------------------------------------------------------------------------
+void NetPlayClient::resetPingData()
+{
+	pingNumSamples = 0;
+	pingDelayLast = 0;
+	pingDelaySum = 0;
+}
+//-----------------------------------------------------------------------------
+double NetPlayClient::getAvgPingDelay()
+{
+	double ms = 0.0;
+	if (pingNumSamples > 0)
+	{
+		ms = static_cast<double>(pingDelaySum) / static_cast<double>(pingNumSamples);
+	}
+	return ms;
+}
+//-----------------------------------------------------------------------------
 static void clientMessageCallback( void *userData, void *msgBuf, size_t msgSize )
 {
 	NetPlayClient *client = static_cast<NetPlayClient*>(userData);
@@ -821,6 +917,8 @@ void NetPlayClient::update(void)
 
 		statusMsg.toNetworkByteOrder();
 		sock->write( reinterpret_cast<const char*>(&statusMsg), sizeof(statusMsg) );
+
+		flushData();
 	}
 }
 //-----------------------------------------------------------------------------
@@ -975,6 +1073,7 @@ void NetPlayClient::clientProcessMessage( void *msgBuf, size_t msgSize )
 
 			opsCrc32 = 0;
 			netPlayFrameData.reset();
+			inputClear();
 		}
 		break;
 		case NETPLAY_RUN_FRAME_REQ:
@@ -993,6 +1092,17 @@ void NetPlayClient::clientProcessMessage( void *msgBuf, size_t msgSize )
 			{
 				pushBackInput( inputFrame );
 			}
+		}
+		break;
+		case NETPLAY_PING_REQ:
+		{
+			netPlayPingResp pong;
+			netPlayPingReq *ping = static_cast<netPlayPingReq*>(msgBuf);
+			ping->toHostByteOrder();
+
+			pong.hostTimeStamp = ping->hostTimeStamp;
+			pong.toNetworkByteOrder();
+			sock->write( (const char*)&pong, sizeof(netPlayPingResp) );
 		}
 		break;
 		default:
