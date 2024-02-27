@@ -141,11 +141,11 @@ if(WIN32)
      if ( ${USE_LIBAV} )
         add_definitions( -D_USE_LIBAV ${LIBAV_CFLAGS} )
         include_directories( ${FFMPEG_INSTALL_PREFIX}/ffmpeg/include )
-        set( LIBAV_LDFLAGS  ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/avcodec.lib
-        	                 ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/avformat.lib
-                	         ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/avutil.lib
-                        	 ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/swscale.lib
-                        	 ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/swresample.lib )
+        set( LIBAV_LDFLAGS  ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/${CMAKE_SYSTEM_PROCESSOR}/avcodec.lib
+        	                 ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/${CMAKE_SYSTEM_PROCESSOR}/avformat.lib
+                	         ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/${CMAKE_SYSTEM_PROCESSOR}/avutil.lib
+                        	 ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/${CMAKE_SYSTEM_PROCESSOR}/swscale.lib
+                        	 ${FFMPEG_INSTALL_PREFIX}/ffmpeg/lib/${CMAKE_SYSTEM_PROCESSOR}/swresample.lib )
      endif()
 
 else(WIN32)
