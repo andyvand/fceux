@@ -61,7 +61,6 @@ static char FileExt[2048];	//Includes the . character, as in ".nes"
 char FileBase[2048];
 static char FileBaseDirectory[2048];
 
-
 void ApplyIPS(FILE *ips, FCEUFILE* fp)
 {
 	uint8 header[5];
