@@ -4,6 +4,7 @@
 
 #include <string.h>
 #include <stdint.h>
+#include "version.h"
 
 // Network Byte Swap Functions
 uint16_t netPlayByteSwap(uint16_t);
@@ -37,7 +38,7 @@ enum netPlayerId
 	NETPLAY_PLAYER4
 };
 
-static const uint32_t NETPLAY_MAGIC_NUMBER = 0xaa55aa55;
+static constexpr uint32_t NETPLAY_MAGIC_NUMBER = 0xaa55aa55;
 
 struct netPlayMsgHdr
 {
@@ -92,12 +93,17 @@ struct netPlayAuthResp
 {
 	netPlayMsgHdr  hdr;
 
+	uint16_t  appVersionMajor;
+	uint16_t  appVersionMinor;
+	uint32_t  appVersionPatch;
 	char playerId;
 	char userName[64];
 	char pswd[72];
 
 	netPlayAuthResp(void)
-		: hdr(NETPLAY_AUTH_RESP, sizeof(netPlayAuthResp)), playerId(NETPLAY_SPECTATOR)
+		: hdr(NETPLAY_AUTH_RESP, sizeof(netPlayAuthResp)),
+		appVersionMajor(FCEU_VERSION_MAJOR), appVersionMinor(FCEU_VERSION_MINOR), appVersionPatch(FCEU_VERSION_PATCH),
+		playerId(NETPLAY_SPECTATOR)
 	{
 		memset(pswd, 0, sizeof(pswd));
 	}
@@ -105,19 +111,26 @@ struct netPlayAuthResp
 	void toHostByteOrder()
 	{
 		hdr.toHostByteOrder();
+		appVersionMajor = netPlayByteSwap(appVersionMajor);
+		appVersionMinor = netPlayByteSwap(appVersionMinor);
+		appVersionPatch = netPlayByteSwap(appVersionPatch);
 	}
 
 	void toNetworkByteOrder()
 	{
 		hdr.toNetworkByteOrder();
+		appVersionMajor = netPlayByteSwap(appVersionMajor);
+		appVersionMinor = netPlayByteSwap(appVersionMinor);
+		appVersionPatch = netPlayByteSwap(appVersionPatch);
 	}
 };
 
 struct netPlayTextMsgFlags
 {
-	static const uint32_t DISCONNECT = 0x00000001;
-	static const uint32_t    WARNING = 0x00000002;
-	static const uint32_t       INFO = 0x00000004;
+	static constexpr uint32_t Disconnect = 0x00000001;
+	static constexpr uint32_t      Error = 0x00000002;
+	static constexpr uint32_t    Warning = 0x00000004;
+	static constexpr uint32_t       Info = 0x00000008;
 };
 
 template <size_t N=8>
@@ -125,12 +138,11 @@ struct netPlayTextMsg
 {
 	netPlayMsgHdr  hdr;
 
-	unsigned short code;
-	unsigned short flags;
-	unsigned short dataSize;
+	uint32_t flags;
+	uint16_t dataSize;
 
 	netPlayTextMsg(int type)
-		: hdr(type, sizeof(netPlayTextMsg)), code(0), flags(0), dataSize(0)
+		: hdr(type, sizeof(netPlayTextMsg)), flags(0), dataSize(0)
 	{
 		hdr.msgSize = sizeof(*this) - N + 1;
 		memset(data, 0, N);
@@ -202,7 +214,6 @@ struct netPlayTextMsg
 	void toHostByteOrder()
 	{
 		hdr.toHostByteOrder();
-		code  = netPlayByteSwap(code);
 		flags = netPlayByteSwap(flags);
 		dataSize = netPlayByteSwap(dataSize);
 	}
@@ -210,7 +221,6 @@ struct netPlayTextMsg
 	void toNetworkByteOrder()
 	{
 		hdr.toNetworkByteOrder();
-		code  = netPlayByteSwap(code);
 		flags = netPlayByteSwap(flags);
 		dataSize = netPlayByteSwap(dataSize);
 	}
@@ -285,6 +295,7 @@ struct netPlayClientState
 	uint32_t  opsFrame; // Last frame for ops data
 	uint32_t  opsChkSum;
 	uint32_t  ramChkSum;
+	uint32_t  romCrc32;
 	uint8_t   ctrlState[4];
 
 	static constexpr uint32_t  PAUSE_FLAG  = 0x0001;
@@ -292,7 +303,7 @@ struct netPlayClientState
 
 	netPlayClientState(void)
 		: hdr(NETPLAY_CLIENT_STATE, sizeof(netPlayClientState)), flags(0),
-		frameRdy(0), frameRun(0), opsChkSum(0), ramChkSum(0)
+		frameRdy(0), frameRun(0), opsChkSum(0), ramChkSum(0), romCrc32(0)
 	{
 		memset( ctrlState, 0, sizeof(ctrlState) );
 	}
@@ -306,6 +317,7 @@ struct netPlayClientState
 		opsFrame  = netPlayByteSwap(opsFrame);
 		opsChkSum = netPlayByteSwap(opsChkSum);
 		ramChkSum = netPlayByteSwap(ramChkSum);
+		romCrc32  = netPlayByteSwap(romCrc32);
 	}
 
 	void toNetworkByteOrder()
@@ -317,6 +329,7 @@ struct netPlayClientState
 		opsFrame  = netPlayByteSwap(opsFrame);
 		opsChkSum = netPlayByteSwap(opsChkSum);
 		ramChkSum = netPlayByteSwap(ramChkSum);
+		romCrc32  = netPlayByteSwap(romCrc32);
 	}
 };
 
