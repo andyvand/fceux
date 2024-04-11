@@ -331,6 +331,7 @@ class  consoleWin_t : public QMainWindow
 		void romUnload(void);
 		void stateLoaded(void);
 		void nesResetOccurred(void);
+		void pauseToggled(bool state);
 
 	public slots:
 		void openDebugWindow(void);
@@ -340,6 +341,7 @@ class  consoleWin_t : public QMainWindow
 		void toggleMenuVis(void);
 		void recordMovie(void);
 		void winResizeIx(int iScale);
+		void onNetPlayChange(void);
 	private slots:
 		void closeApp(void);
 		void openROMFile(void);
