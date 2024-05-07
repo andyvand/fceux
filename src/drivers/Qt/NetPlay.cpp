@@ -25,6 +25,7 @@
 
 #include "../../fceu.h"
 #include "../../cart.h"
+#include "../../cheat.h"
 #include "../../state.h"
 #include "../../movie.h"
 #include "../../debug.h"
@@ -182,6 +183,7 @@ NetPlayServer::NetPlayServer(QObject *parent)
 	connect(consoleWindow, SIGNAL(romUnload(void)), this, SLOT(onRomUnload(void)));
 	connect(consoleWindow, SIGNAL(stateLoaded(void)), this, SLOT(onStateLoad(void)));
 	connect(consoleWindow, SIGNAL(nesResetOccurred(void)), this, SLOT(onNesReset(void)));
+	connect(consoleWindow, SIGNAL(cheatsChanged(void)), this, SLOT(onCheatsChanged(void)));
 	connect(consoleWindow, SIGNAL(pauseToggled(bool)), this, SLOT(onPauseToggled(bool)));
 
 	FCEU_WRAPPER_LOCK();
@@ -341,23 +343,34 @@ int NetPlayServer::sendRomLoadReq( NetPlayClient *client )
 	char buf[BufferSize];
 	size_t bytesRead;
 	long fileSize = 0;
+	int userCancel = 0;
+	int archiveIndex = -1;
 	netPlayLoadRomReq msg;
+	const char* romextensions[] = { "nes", "fds", "nsf", 0 };
 
 	const char *filepath = nullptr;
 
-	if ( GameInfo )
+	if ( GameInfo == nullptr)
 	{
-		printf("filename: '%s' \n", GameInfo->filename );
-		printf("archiveFilename: '%s' \n", GameInfo->archiveFilename );
+		return -1;
+	}
 
-		if (GameInfo->archiveFilename)
-		{
-			filepath = GameInfo->archiveFilename;
-		}
-		else
-		{
-			filepath = GameInfo->filename;
-		}
+	//printf("filename: '%s' \n", GameInfo->filename );
+	//printf("archiveFilename: '%s' \n", GameInfo->archiveFilename );
+
+	if (GameInfo->archiveFilename)
+	{
+		filepath = GameInfo->archiveFilename;
+	}
+	else
+	{
+		filepath = GameInfo->filename;
+	}
+	archiveIndex = GameInfo->archiveIndex;
+
+	if (archiveIndex >= 0)
+	{
+		msg.archiveIndex = archiveIndex;
 	}
 
 	if (filepath == nullptr)
@@ -365,43 +378,73 @@ int NetPlayServer::sendRomLoadReq( NetPlayClient *client )
 		return -1;
 	}
 	printf("Prep ROM Load Request: %s \n", filepath );
-	FILE *fp = ::fopen( filepath, "rb");
+
+	FCEUFILE* fp = FCEU_fopen( filepath, nullptr, "rb", 0, archiveIndex, romextensions, &userCancel);
 
 	if (fp == nullptr)
 	{
 		return -1;
 	}
-	fseek( fp, 0, SEEK_END);
+	fileSize = fp->size;
 
-	fileSize = ftell(fp);
-
-	rewind(fp);
+	QFileInfo fileInfo(GameInfo->filename);
 
 	msg.hdr.msgSize += fileSize;
 	msg.fileSize     = fileSize;
-	Strlcpy( msg.fileName, GameInfo->filename, sizeof(msg.fileName) );
+	Strlcpy( msg.fileName, fileInfo.fileName().toLocal8Bit().constData(), sizeof(msg.fileName) );
 
 	printf("Sending ROM Load Request: %s  %lu\n", filepath, fileSize );
 
 	sendMsg( client, &msg, sizeof(netPlayLoadRomReq), [&msg]{ msg.toNetworkByteOrder(); } );
 
-	while ( (bytesRead = fread( buf, 1, sizeof(buf), fp )) > 0 )
+	while ( (bytesRead = FCEU_fread( buf, 1, sizeof(buf), fp )) > 0 )
 	{
 		sendMsg( client, buf, bytesRead );
 	}
 	client->flushData();
 
-	::fclose(fp);
+	FCEU_fclose(fp);
 
 	return 0;
+}
+//-----------------------------------------------------------------------------
+struct NetPlayServerCheatQuery
+{
+	int  numLoaded = 0;
+
+	netPlayLoadStateResp::CheatData data[netPlayLoadStateResp::MaxCheats];
+};
+
+static int serverActiveCheatListCB(const char *name, uint32 a, uint8 v, int c, int s, int type, void *data)
+{
+	NetPlayServerCheatQuery* query = static_cast<NetPlayServerCheatQuery*>(data);
+
+	const int i = query->numLoaded;
+
+	if (i < netPlayLoadStateResp::MaxCheats)
+	{
+		auto& cheat = query->data[i];
+		cheat.addr = a;
+		cheat.val  = v;
+		cheat.cmp  = c;
+		cheat.type = type;
+		cheat.stat = s;
+		Strlcpy( cheat.name, name, sizeof(cheat.name));
+
+		query->numLoaded++;
+	}
+
+	return 1;
 }
 //-----------------------------------------------------------------------------
 int NetPlayServer::sendStateSyncReq( NetPlayClient *client )
 {
 	EMUFILE_MEMORY em;
-	int compressionLevel = 1;
+	int numCtrlFrames = 0, numCheats = 0, compressionLevel = 1;
 	static constexpr size_t maxBytesPerWrite = 32 * 1024;
 	netPlayLoadStateResp resp;
+	netPlayLoadStateResp::CtrlData ctrlData[netPlayLoadStateResp::MaxCtrlFrames];
+	NetPlayServerCheatQuery cheatQuery;
 
 	if ( GameInfo == nullptr )
 	{
@@ -409,9 +452,9 @@ int NetPlayServer::sendStateSyncReq( NetPlayClient *client )
 	}
 	FCEUSS_SaveMS( &em, compressionLevel );
 
-	resp.hdr.msgSize += em.size();
 	resp.stateSize    = em.size();
 	resp.opsCrc32     = opsCrc32;
+	resp.romCrc32     = romCrc32;
 
 	NetPlayFrameData lastFrameData;
 	netPlayFrameData.getLast( lastFrameData );
@@ -428,20 +471,34 @@ int NetPlayServer::sendStateSyncReq( NetPlayClient *client )
 		{
 			if (i < netPlayLoadStateResp::MaxCtrlFrames)
 			{
-				resp.ctrlData[i].frameNum = inputFrame.frameCounter;
-				resp.ctrlData[i].ctrlState[0] = inputFrame.ctrl[0];
-				resp.ctrlData[i].ctrlState[1] = inputFrame.ctrl[1];
-				resp.ctrlData[i].ctrlState[2] = inputFrame.ctrl[2];
-				resp.ctrlData[i].ctrlState[3] = inputFrame.ctrl[3];
+				ctrlData[i].frameNum = netPlayByteSwap(inputFrame.frameCounter);
+				ctrlData[i].ctrlState[0] = inputFrame.ctrl[0];
+				ctrlData[i].ctrlState[1] = inputFrame.ctrl[1];
+				ctrlData[i].ctrlState[2] = inputFrame.ctrl[2];
+				ctrlData[i].ctrlState[3] = inputFrame.ctrl[3];
 				i++;
 			}
 		}
-		resp.numCtrlFrames = i;
+		resp.numCtrlFrames = numCtrlFrames = i;
 	}
+
+	FCEUI_ListCheats(::serverActiveCheatListCB, (void *)&cheatQuery);
+	resp.numCheats = numCheats = cheatQuery.numLoaded;
+
+	resp.calcTotalSize();
 
 	printf("Sending ROM Sync Request: %zu\n", em.size());
 
 	sendMsg( client, &resp, sizeof(netPlayLoadStateResp), [&resp]{ resp.toNetworkByteOrder(); } );
+
+	if (numCtrlFrames > 0)
+	{
+		sendMsg( client, ctrlData, numCtrlFrames * sizeof(netPlayLoadStateResp::CtrlData) );
+	}
+	if (numCheats > 0)
+	{
+		sendMsg( client, &cheatQuery.data, numCheats * sizeof(netPlayLoadStateResp::CheatData) );
+	}
 	//sendMsg( client, em.buf(), em.size() );
 
 	const unsigned char* bufPtr = em.buf();
@@ -583,6 +640,7 @@ void NetPlayServer::onRomLoad()
 //-----------------------------------------------------------------------------
 void NetPlayServer::onRomUnload()
 {
+	//printf("ROM UnLoaded!\n");
 	netPlayMsgHdr unloadMsg(NETPLAY_UNLOAD_ROM_REQ);
 
 	romCrc32 = 0;
@@ -637,6 +695,32 @@ void NetPlayServer::onNesReset()
 	for (auto& client : clientList )
 	{
 		sendRomLoadReq( client );
+		sendStateSyncReq( client );
+	}
+	FCEU_WRAPPER_UNLOCK();
+}
+//-----------------------------------------------------------------------------
+void NetPlayServer::onCheatsChanged()
+{
+	//printf("NES Cheats Event!\n");
+	if (romCrc32 == 0)
+	{
+		return;
+	}
+	FCEU_WRAPPER_LOCK();
+
+	opsCrc32 = 0;
+	netPlayFrameData.reset();
+
+	inputClear();
+	inputFrameCount = static_cast<uint32_t>(currFrameCounter);
+
+	sendPauseAll();
+
+	// NES Reset has occurred on server, signal clients sync
+	for (auto& client : clientList )
+	{
+		//sendRomLoadReq( client );
 		sendStateSyncReq( client );
 	}
 	FCEU_WRAPPER_UNLOCK();
@@ -791,7 +875,7 @@ void NetPlayServer::serverProcessMessage( NetPlayClient *client, void *msgBuf, s
 			client->gpData[3] = msg->ctrlState[3];
 
 			client->setPaused( (msg->flags & netPlayClientState::PauseFlag ) ? true : false );
-			client->setDesync( (msg->flags & netPlayClientState::DesyncFlag) ? true : false );
+			//client->setDesync( (msg->flags & netPlayClientState::DesyncFlag) ? true : false );
 
 			client->romMatch = (romCrc32 == msg->romCrc32);
 
@@ -811,7 +895,15 @@ void NetPlayServer::serverProcessMessage( NetPlayClient *client, void *msgBuf, s
 				{
 					printf("Client %s Frame:%u  is NOT in Sync: OPS:%i  RAM:%i\n",
 							client->userName.toLocal8Bit().constData(), msg->frameRun, opsSync, ramSync);
+
+					if (0 == client->desyncCount)
+					{
+						client->desyncSinceReset++;
+						client->totalDesyncCount++;
+					}
 					client->desyncCount++;
+
+					client->setDesync(true);
 
 					if (client->desyncCount > forceResyncCount)
 					{
@@ -830,6 +922,7 @@ void NetPlayServer::serverProcessMessage( NetPlayClient *client, void *msgBuf, s
 					}
 					else
 					{
+						client->setDesync(false);
 						client->desyncCount = 0;
 					}
 				}
@@ -1497,44 +1590,44 @@ void NetPlayClient::onSocketError(QAbstractSocket::SocketError error)
 	emit errorOccurred(errorMsg);
 }
 //-----------------------------------------------------------------------------
-int NetPlayClient::requestRomLoad( const char *romPath )
+int NetPlayClient::requestRomLoad( const char *romPathIn )
 {
 	constexpr size_t BufferSize = 32 * 1024;
 	char buf[BufferSize];
 	size_t bytesRead;
 	long fileSize = 0;
+	int userCancel = 0;
+	const int archiveIndex = -1;
+	std::string romPath(romPathIn);
 	netPlayLoadRomReq msg;
-	QFileInfo fi( romPath );
+	const char* romextensions[] = { "nes", "fds", "nsf", 0 };
 
-	printf("Prep ROM Load Request: %s \n", romPath );
-	FILE *fp = ::fopen( romPath, "rb");
+	printf("Prep ROM Load Request: %s \n", romPath.c_str() );
+	FCEUFILE* fp = FCEU_fopen( romPath.c_str(), nullptr, "rb", 0, archiveIndex, romextensions, &userCancel);
 
 	if (fp == nullptr)
 	{
 		return -1;
 	}
-	fseek( fp, 0, SEEK_END);
-
-	fileSize = ftell(fp);
-
-	rewind(fp);
+	QFileInfo fi( fp->filename.c_str() );
+	fileSize = fp->size;
 
 	msg.hdr.msgSize += fileSize;
 	msg.fileSize     = fileSize;
 	Strlcpy( msg.fileName, fi.fileName().toLocal8Bit().constData(), sizeof(msg.fileName) );
 
-	printf("Sending ROM Load Request: %s  %lu\n", romPath, fileSize );
+	printf("Sending ROM Load Request: %s  %lu\n", msg.fileName, fileSize );
 
 	msg.toNetworkByteOrder();
 	sock->write( reinterpret_cast<const char*>(&msg), sizeof(netPlayLoadRomReq) );
 
-	while ( (bytesRead = fread( buf, 1, sizeof(buf), fp )) > 0 )
+	while ( (bytesRead = FCEU_fread( buf, 1, sizeof(buf), fp )) > 0 )
 	{
 		sock->write( buf, bytesRead );
 	}
 	sock->flush();
 
-	::fclose(fp);
+	FCEU_fclose(fp);
 
 	return 0;
 }
@@ -1567,6 +1660,11 @@ int NetPlayClient::requestStateLoad(EMUFILE *is)
 	if (readResult != dataSize )
 	{
 		printf("Read Error\n");
+	}
+
+	if (currCartInfo != nullptr)
+	{
+		resp.romCrc32 = romCrc32;
 	}
 	printf("Sending Client ROM Sync Request: %u\n", resp.stateSize);
 
@@ -1603,11 +1701,21 @@ int NetPlayClient::requestSync(void)
 	return 0;
 }
 //-----------------------------------------------------------------------------
-void NetPlayClient::recordPingResult( uint64_t delay_ms )
+void NetPlayClient::recordPingResult( const uint64_t delay_ms )
 {
 	pingNumSamples++;
 	pingDelayLast = delay_ms;
 	pingDelaySum += delay_ms;
+
+	if (delay_ms < pingDelayMin)
+	{
+		pingDelayMin = delay_ms;
+	}
+
+	if (delay_ms > pingDelayMax)
+	{
+		pingDelayMax = delay_ms;
+	}
 }
 //-----------------------------------------------------------------------------
 void NetPlayClient::resetPingData()
@@ -1615,6 +1723,8 @@ void NetPlayClient::resetPingData()
 	pingNumSamples = 0;
 	pingDelayLast = 0;
 	pingDelaySum = 0;
+	pingDelayMax = 0;
+	pingDelayMin = 1000;
 }
 //-----------------------------------------------------------------------------
 double NetPlayClient::getAvgPingDelay()
@@ -1858,22 +1968,26 @@ void NetPlayClient::clientProcessMessage( void *msgBuf, size_t msgSize )
 		break;
 		case NETPLAY_LOAD_ROM_REQ:
 		{
-			QTemporaryFile tmpFile;
 			netPlayLoadRomReq *msg = static_cast<netPlayLoadRomReq*>(msgBuf);
 			msg->toHostByteOrder();
 			const char *romData = &static_cast<const char*>(msgBuf)[ sizeof(netPlayLoadRomReq) ];
 
-			FCEU_printf("Load ROM Request Received: %s\n", msg->fileName);
+			QFileInfo fileInfo = QFileInfo(msg->fileName);
+			QString tempPath = consoleWindow->getTempDir() + QString("/") + fileInfo.fileName();
+			FCEU_printf("Load ROM Request Received: %s\n", fileInfo.fileName().toLocal8Bit().constData());
 
-			tmpFile.setFileTemplate(QDir::tempPath() + QString("/tmpRom_XXXXXX.nes"));
-			tmpFile.open();
+			QFile tmpFile( tempPath );
+			//tmpFile.setFileTemplate(QDir::tempPath() + QString("/tmpRom_XXXXXX.nes"));
+			tmpFile.open(QIODevice::ReadWrite);
 			QString filepath = tmpFile.fileName();
 			printf("Dumping Temp Rom to: %s\n", tmpFile.fileName().toLocal8Bit().constData());
 			tmpFile.write( romData, msgSize );
 			tmpFile.close();
 
 			FCEU_WRAPPER_LOCK();
+			fceuWrapperSetArchiveFileLoadIndex( msg->archiveIndex );
 			LoadGame( filepath.toLocal8Bit().constData(), true, true );
+			fceuWrapperClearArchiveFileLoadIndex();
 
 			opsCrc32 = 0;
 			netPlayFrameData.reset();
@@ -1893,6 +2007,7 @@ void NetPlayClient::clientProcessMessage( void *msgBuf, size_t msgSize )
 			netPlayLoadStateResp* msg = static_cast<netPlayLoadStateResp*>(msgBuf);
 			msg->toHostByteOrder();
 
+			const bool romMatch = (msg->romCrc32 = romCrc32);
 			char *stateData = msg->stateDataBuf();
 			const uint32_t stateDataSize = msg->stateDataSize();
 
@@ -1901,34 +2016,64 @@ void NetPlayClient::clientProcessMessage( void *msgBuf, size_t msgSize )
 			EMUFILE_MEMORY em( stateData, stateDataSize );
 
 			FCEU_WRAPPER_LOCK();
-			serverRequestedStateLoad = true;
-			FCEUSS_LoadFP( &em, SSLOADPARAM_NOBACKUP );
-			serverRequestedStateLoad = false;
 
-			opsCrc32 = msg->opsCrc32;
-			netPlayFrameData.reset();
+			bool dataValid = romMatch;
 
-			NetPlayFrameData data;
-			data.frameNum = msg->lastFrame.num;
-			data.opsCrc32 = msg->lastFrame.opsCrc32;
-			data.ramCrc32 = msg->lastFrame.ramCrc32;
-
-			netPlayFrameData.push( data );
-
-			inputClear();
-
-			const int numInputFrames = msg->numCtrlFrames;
-			for (int i=0; i<numInputFrames; i++)
+			if (dataValid)
 			{
-				NetPlayFrameInput inputFrame;
+				serverRequestedStateLoad = true;
+				FCEUSS_LoadFP( &em, SSLOADPARAM_NOBACKUP );
+				serverRequestedStateLoad = false;
 
-				inputFrame.frameCounter = msg->ctrlData[i].frameNum;
-				inputFrame.ctrl[0] = msg->ctrlData[i].ctrlState[0];
-				inputFrame.ctrl[1] = msg->ctrlData[i].ctrlState[1];
-				inputFrame.ctrl[2] = msg->ctrlData[i].ctrlState[2];
-				inputFrame.ctrl[3] = msg->ctrlData[i].ctrlState[3];
+				opsCrc32 = msg->opsCrc32;
+				netPlayFrameData.reset();
 
-				pushBackInput( inputFrame );
+				NetPlayFrameData data;
+				data.frameNum = msg->lastFrame.num;
+				data.opsCrc32 = msg->lastFrame.opsCrc32;
+				data.ramCrc32 = msg->lastFrame.ramCrc32;
+
+				netPlayFrameData.push( data );
+
+				inputClear();
+
+				const int numInputFrames = msg->numCtrlFrames;
+				for (int i=0; i<numInputFrames; i++)
+				{
+					NetPlayFrameInput inputFrame;
+					auto ctrlData = msg->ctrlDataBuf();
+
+					ctrlData[i].toHostByteOrder();
+					inputFrame.frameCounter = ctrlData[i].frameNum;
+					inputFrame.ctrl[0] = ctrlData[i].ctrlState[0];
+					inputFrame.ctrl[1] = ctrlData[i].ctrlState[1];
+					inputFrame.ctrl[2] = ctrlData[i].ctrlState[2];
+					inputFrame.ctrl[3] = ctrlData[i].ctrlState[3];
+
+					pushBackInput( inputFrame );
+				}
+
+				const int numCheats = msg->numCheats;
+
+				if (numCheats > 0)
+				{
+					const int lastCheatIdx = numCheats - 1;
+
+					FCEU_FlushGameCheats(0, 1);
+					for (int i=0; i<numCheats; i++)
+					{
+						auto cheatBuf = msg->cheatDataBuf();
+						auto& cheatData = cheatBuf[i];
+						// Set cheat rebuild flag on last item.
+						bool lastItem = (i == lastCheatIdx);
+
+						FCEUI_AddCheat( cheatData.name, cheatData.addr, cheatData.val, cheatData.cmp, cheatData.type, cheatData.stat, lastItem );
+					}
+				}
+				else
+				{
+					FCEU_DeleteAllCheats();
+				}
 			}
 			FCEU_WRAPPER_UNLOCK();
 
@@ -2754,6 +2899,40 @@ void NetPlayClientTreeItem::updateData()
 		setText( 1, QObject::tr(roleString) );
 		setText( 2, state);
 		setText( 3, QString::number(client->currentFrame) );
+
+		if (isExpanded())
+		{
+			FCEU::FixedString<256> infoLine;
+			const int numChildren = childCount();
+
+			//printf("Calculating Expanded Item\n");
+
+			for (int i=0; i<numChildren; i++)
+			{
+				auto* item = static_cast<NetPlayClientTreeItem*>( child(i) );
+				switch (item->type)
+				{
+					case NetPlayClientTreeItem::PingInfo:
+					{
+						infoLine.sprintf("Ping ms:     Avg %.2f     Min: %llu     Max: %llu", 
+								client->getAvgPingDelay(), client->getMinPingDelay(), client->getMaxPingDelay() );
+						item->setFirstColumnSpanned(true);
+						item->setText( 0, QObject::tr(infoLine.c_str()) );
+					}
+					break;
+					case NetPlayClientTreeItem::DesyncInfo:
+					{
+						infoLine.sprintf("Desync Count:  Since Last Sync: %u    Total: %u",
+							     client->desyncSinceReset, client->totalDesyncCount );
+						item->setFirstColumnSpanned(true);
+						item->setText( 0, QObject::tr(infoLine.c_str()) );
+					}
+					break;
+					default:
+					break;
+				}
+			}
+		}
 	}
 }
 //----------------------------------------------------------------------------
@@ -2779,10 +2958,21 @@ void NetPlayHostStatusDialog::loadClientTree()
 	{
 		return;
 	}
+	QFont font;
+
+	font.setFamily("Courier New");
+	font.setStyle( QFont::StyleNormal );
+	font.setStyleHint( QFont::Monospace );
+
 	auto* serverTopLvlItem = new NetPlayClientTreeItem();
 
 	serverTopLvlItem->server = server;
 	serverTopLvlItem->updateData();
+
+	serverTopLvlItem->setFont( 0, font );
+	serverTopLvlItem->setFont( 1, font );
+	serverTopLvlItem->setFont( 2, font );
+	serverTopLvlItem->setFont( 3, font );
 
 	clientTree->addTopLevelItem( serverTopLvlItem );
 
@@ -2794,6 +2984,23 @@ void NetPlayHostStatusDialog::loadClientTree()
 
 		clientTopLvlItem->client = client;
 		clientTopLvlItem->updateData();
+
+		auto* clientPingInfo = new NetPlayClientTreeItem();
+		clientPingInfo->setFont( 0, font );
+		clientPingInfo->type = NetPlayClientTreeItem::PingInfo;
+		clientPingInfo->setFirstColumnSpanned(true);
+		clientTopLvlItem->addChild( clientPingInfo );
+
+		auto* clientDesyncInfo = new NetPlayClientTreeItem();
+		clientDesyncInfo->setFont( 0, font );
+		clientDesyncInfo->type = NetPlayClientTreeItem::DesyncInfo;
+		clientDesyncInfo->setFirstColumnSpanned(true);
+		clientTopLvlItem->addChild( clientDesyncInfo );
+
+		clientTopLvlItem->setFont( 0, font );
+		clientTopLvlItem->setFont( 1, font );
+		clientTopLvlItem->setFont( 2, font );
+		clientTopLvlItem->setFont( 3, font );
 
 		clientTree->addTopLevelItem( clientTopLvlItem );
 	}
@@ -3009,10 +3216,11 @@ uint64_t netPlayByteSwap(uint64_t in)
 //----------------------------------------------------------------------------
 uint32_t netPlayCalcRamChkSum()
 {
+	constexpr int ramSize = 0x800;
 	uint32_t crc = 0;
-	uint8_t ram[256];
+	uint8_t ram[ramSize];
 
-	for (int i=0; i<256; i++)
+	for (int i=0; i<ramSize; i++)
 	{
 		ram[i] = GetMem(i);
 	}
